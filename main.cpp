@@ -52,14 +52,23 @@ namespace BetterDrivingPhysicsSA {
         return 0.0f;
     }
 
-    static float DotProductSimple(const CVector& a, const CVector& b) {
+    static float AbsFloat(float value) {
+        return (float)fabs(value);
+    }
+
+    static float DotSimple(const CVector& a, const CVector& b) {
         return a.x * b.x + a.y * b.y + a.z * b.z;
     }
 
-    static CVector ScaledVector(const CVector& v, float s) {
-        CVector out = v;
-        out *= s;
-        return out;
+    static float SmoothStep01(float t) {
+        t = SaturateFloat(t);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    static float RemapTo01(float value, float fromA, float fromB) {
+        if (fromB <= fromA)
+            return 0.0f;
+        return SaturateFloat((value - fromA) / (fromB - fromA));
     }
 
     static int GetDriveLayout(CAutomobile* car) {
@@ -72,10 +81,8 @@ namespace BetterDrivingPhysicsSA {
 
         if (driveType == 'F')
             return DRIVE_LAYOUT_FWD;
-
         if (driveType == 'R')
             return DRIVE_LAYOUT_RWD;
-
         if (driveType == '4')
             return DRIVE_LAYOUT_AWD;
 
@@ -111,7 +118,6 @@ namespace BetterDrivingPhysicsSA {
     static void ResetState(CVehicle* vehicle) {
         if (gState.vehicle != vehicle) {
             gState.vehicle = vehicle;
-
             if (vehicle)
                 gState.smoothedSteer = vehicle->m_fSteerAngle;
             else
@@ -124,7 +130,7 @@ namespace BetterDrivingPhysicsSA {
         float speedNorm;
         float lockScale;
         float allowedLock;
-        float steerNow;
+        float targetSteer;
         float steerResponse;
         float blend;
 
@@ -132,49 +138,58 @@ namespace BetterDrivingPhysicsSA {
             return;
 
         steeringLockRad = car->m_pHandlingData->m_fSteeringLock * BDP_DEG_TO_RAD;
-        speedNorm = SaturateFloat(speed2D / 0.90f);
+        speedNorm = SaturateFloat(speed2D / 0.95f);
 
-        lockScale = LerpFloat(1.00f, 0.78f, speedNorm);
+        /* keep low-speed maneuverability, trim twitch at speed */
+        lockScale = LerpFloat(1.00f, 0.80f, speedNorm);
         allowedLock = steeringLockRad * lockScale;
 
-        steerNow = ClampFloat(car->m_fSteerAngle, -allowedLock, allowedLock);
+        targetSteer = ClampFloat(car->m_fSteerAngle, -allowedLock, allowedLock);
 
-        blend = LerpFloat(0.40f, 0.20f, speedNorm);
-        blend = SaturateFloat(blend * dt);
+        /* very light smoothing only */
+        steerResponse = LerpFloat(0.48f, 0.22f, speedNorm);
+        blend = SaturateFloat(steerResponse * dt);
 
-        gState.smoothedSteer = LerpFloat(gState.smoothedSteer, steerNow, blend);
+        gState.smoothedSteer = LerpFloat(gState.smoothedSteer, targetSteer, blend);
         car->m_fSteerAngle = gState.smoothedSteer;
     }
 
-    static void ApplySlipAssist(CAutomobile* car, float dt) {
+    static void ApplyBetterDriving(CAutomobile* car, float dt) {
         CPad* pad;
         CVector forward;
         CVector right;
-        CVector sideCorrection;
+
         float localForward;
         float localSide;
         float absForward;
         float absSide;
         float speed2D;
+        float speedNorm;
+
         bool handbrake;
         bool braking;
         bool accelerating;
         bool reversing;
+
         float slipAngle;
-        float startAssistAngle;
-        float fullAssistAngle;
-        float assist;
-        float speedNorm;
+        float slipStart;
+        float slipPeak;
+        float slipCurve;
+
         int layout;
-        float yawAssist;
-        float brakeAssist;
-        float throttleRelax;
-        float yawDamping;
+
+        float yawTrimStrength;
+        float sideTrimStrength;
+        float brakeStabilityStrength;
+        float throttleYawStrength;
+
         float slideSign;
         float yawSign;
+        float steerInputNorm;
+        float steerDirection;
+        float throttleAmount;
+        float brakeAmount;
         float maxYawRate;
-        float sideTrim;
-        float brakeStraighten;
 
         if (!car || !car->m_pHandlingData)
             return;
@@ -189,99 +204,160 @@ namespace BetterDrivingPhysicsSA {
         forward = car->GetForward();
         right = car->GetRight();
 
-        localForward = DotProductSimple(car->m_vecMoveSpeed, forward);
-        localSide = DotProductSimple(car->m_vecMoveSpeed, right);
+        localForward = DotSimple(car->m_vecMoveSpeed, forward);
+        localSide = DotSimple(car->m_vecMoveSpeed, right);
 
-        absForward = (float)fabs(localForward);
-        absSide = (float)fabs(localSide);
+        absForward = AbsFloat(localForward);
+        absSide = AbsFloat(localSide);
         speed2D = car->m_vecMoveSpeed.Magnitude2D();
 
-        if (speed2D < 0.08f)
+        if (speed2D < 0.06f)
             return;
+
+        speedNorm = SaturateFloat((speed2D - 0.08f) / 0.85f);
 
         handbrake = (pad->GetHandBrake() != 0) || (car->bIsHandbrakeOn != 0);
         braking = (pad->GetBrake() > 0) || (car->m_fBreakPedal > 0.08f);
         accelerating = (pad->GetAccelerate() > 0) || (car->m_fGasPedal > 0.08f);
         reversing = (localForward < -0.02f);
 
+        throttleAmount = SaturateFloat(car->m_fGasPedal);
+        brakeAmount = SaturateFloat(car->m_fBreakPedal);
+
+        /* core slip-angle measurement */
         slipAngle = (float)atan2(absSide, absForward + 0.02f);
 
-        startAssistAngle = 8.0f * BDP_DEG_TO_RAD;
-        fullAssistAngle = 22.0f * BDP_DEG_TO_RAD;
+        /*
+            slip curve:
+            - below slipStart: leave car alone
+            - near slipPeak: strongest correction
+            this avoids the "soap" effect
+        */
+        slipStart = 5.5f * BDP_DEG_TO_RAD;
+        slipPeak = 19.0f * BDP_DEG_TO_RAD;
+        slipCurve = SmoothStep01(RemapTo01(slipAngle, slipStart, slipPeak));
 
-        if (slipAngle <= startAssistAngle)
+        if (slipCurve <= 0.0f)
             return;
 
-        assist = SaturateFloat((slipAngle - startAssistAngle) / (fullAssistAngle - startAssistAngle));
-        speedNorm = SaturateFloat((speed2D - 0.10f) / 0.75f);
-        assist *= speedNorm;
+        /* fade out most of the intervention at very low speeds */
+        slipCurve *= speedNorm;
 
-        if (assist <= 0.0f)
+        if (slipCurve <= 0.0f)
             return;
 
         layout = GetDriveLayout(car);
 
-        yawAssist = 1.0f;
-        brakeAssist = 1.0f;
-        throttleRelax = 1.0f;
+        yawTrimStrength = 1.0f;
+        sideTrimStrength = 1.0f;
+        brakeStabilityStrength = 1.0f;
+        throttleYawStrength = 1.0f;
 
         if (layout == DRIVE_LAYOUT_FWD) {
-            yawAssist = 1.08f;
-            brakeAssist = 1.08f;
-            throttleRelax = 0.95f;
+            yawTrimStrength = 1.08f;
+            sideTrimStrength = 1.08f;
+            brakeStabilityStrength = 1.08f;
+            throttleYawStrength = 0.55f;
         }
         else if (layout == DRIVE_LAYOUT_RWD) {
-            yawAssist = 0.90f;
-            brakeAssist = 0.96f;
-            throttleRelax = 0.76f;
+            yawTrimStrength = 0.88f;
+            sideTrimStrength = 0.82f;
+            brakeStabilityStrength = 0.95f;
+            throttleYawStrength = 1.15f;
         }
         else if (layout == DRIVE_LAYOUT_AWD) {
-            yawAssist = 1.00f;
-            brakeAssist = 1.02f;
-            throttleRelax = 0.86f;
+            yawTrimStrength = 0.98f;
+            sideTrimStrength = 0.95f;
+            brakeStabilityStrength = 1.02f;
+            throttleYawStrength = 0.85f;
         }
 
         if (handbrake)
-            assist *= 0.25f;
-
-        if (accelerating && !braking && !reversing)
-            assist *= throttleRelax;
-
-        yawDamping = (0.006f + 0.013f * assist) * yawAssist * dt;
-
-        if (braking && !handbrake)
-            yawDamping *= 1.20f * brakeAssist;
+            slipCurve *= 0.22f;
 
         slideSign = SignFloat(localSide);
         yawSign = SignFloat(car->m_vecTurnSpeed.z);
 
-        if (slideSign != 0.0f && yawSign == slideSign) {
-            car->m_vecTurnSpeed.z -= slideSign * yawDamping;
-        }
-        else {
-            car->m_vecTurnSpeed.z *= (1.0f - 0.006f * assist * dt);
+        /*
+            1) reduce the "toy car" instant yaw feel:
+               trim overspeeding yaw when it matches the slide direction
+        */
+        {
+            float yawTrim = (0.0045f + 0.0105f * slipCurve) * yawTrimStrength * dt;
+
+            if (braking && !handbrake)
+                yawTrim *= (1.10f + 0.15f * brakeAmount);
+
+            if (slideSign != 0.0f && yawSign == slideSign) {
+                car->m_vecTurnSpeed.z -= slideSign * yawTrim;
+            }
+            else {
+                car->m_vecTurnSpeed.z *= (1.0f - 0.0040f * slipCurve * dt);
+            }
         }
 
-        maxYawRate = LerpFloat(0.20f, 0.11f, speedNorm);
-        car->m_vecTurnSpeed.z = ClampFloat(car->m_vecTurnSpeed.z, -maxYawRate, maxYawRate);
-
-        if (!handbrake && slipAngle > (12.0f * BDP_DEG_TO_RAD)) {
-            sideTrim = (0.0010f + 0.0030f * assist) * dt;
+        /*
+            2) mild slip cleanup only when already over the threshold
+               keep this small so it doesn't feel like ice/soap
+        */
+        if (!handbrake) {
+            float sideTrim = (0.0009f + 0.0032f * slipCurve) * sideTrimStrength * dt;
 
             if (accelerating && layout == DRIVE_LAYOUT_RWD)
-                sideTrim *= 0.70f;
+                sideTrim *= 0.72f;
 
             if (braking)
-                sideTrim *= 1.10f;
+                sideTrim *= 1.12f;
 
-            sideCorrection = ScaledVector(right, localSide * sideTrim);
-            car->m_vecMoveSpeed -= sideCorrection;
+            car->m_vecMoveSpeed -= right * (localSide * sideTrim);
         }
 
-        if (braking && !handbrake && speedNorm > 0.2f) {
-            brakeStraighten = (0.0025f + 0.0060f * assist) * dt;
-            car->m_vecTurnSpeed.z *= (1.0f - brakeStraighten);
+        /*
+            3) braking stability:
+               stop the rear from doing dumb snap wiggles under braking
+        */
+        if (braking && !handbrake && speedNorm > 0.15f) {
+            float straighten = (0.0020f + 0.0065f * slipCurve) * brakeStabilityStrength * dt;
+            car->m_vecTurnSpeed.z *= (1.0f - straighten);
         }
+
+        /*
+            4) throttle yaw for RWD/AWD:
+               this is the part SA often lacks and why cars can feel fake-FWD
+               only add a little, only when moving forward, only while steering
+        */
+        steerInputNorm = SaturateFloat(AbsFloat(car->m_fSteerAngle) / (18.0f * BDP_DEG_TO_RAD));
+        steerDirection = SignFloat(car->m_fSteerAngle);
+
+        if (!handbrake && accelerating && !braking && !reversing && steerDirection != 0.0f) {
+            float throttleYaw = 0.0f;
+
+            throttleYaw =
+                (0.0016f + 0.0060f * slipCurve) *
+                throttleYawStrength *
+                throttleAmount *
+                steerInputNorm *
+                speedNorm *
+                dt;
+
+            /*
+                For RWD:
+                add a bit of yaw into the turn under throttle.
+                For FWD:
+                much weaker so it keeps pulling itself straight more.
+            */
+            car->m_vecTurnSpeed.z += steerDirection * throttleYaw;
+        }
+
+        /*
+            5) clamp total yaw so it never turns into nonsense
+        */
+        maxYawRate = LerpFloat(0.22f, 0.12f, speedNorm);
+
+        if (handbrake)
+            maxYawRate *= 1.35f;
+
+        car->m_vecTurnSpeed.z = ClampFloat(car->m_vecTurnSpeed.z, -maxYawRate, maxYawRate);
     }
 
     static void ProcessPlayerCar() {
@@ -310,7 +386,7 @@ namespace BetterDrivingPhysicsSA {
         speed2D = car->m_vecMoveSpeed.Magnitude2D();
 
         ApplySteeringFilter(car, speed2D, dt);
-        ApplySlipAssist(car, dt);
+        ApplyBetterDriving(car, dt);
     }
 
     static void OnGameProcess() {
